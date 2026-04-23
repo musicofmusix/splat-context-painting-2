@@ -248,6 +248,7 @@ class PSGUI:
         self.embedding_encoder_job = None
         self.embedding_loop_interval = 0.5
         self.embedding_loop_prevtime = 0.0
+        self.embedding_last_camera_mat = None
 
         # embedding update exponential moving average param
         # higher = trust the past, lower = trust the present
@@ -1290,6 +1291,12 @@ class PSGUI:
     @torch.no_grad()
     def drive_run_loop(self):
         if self.embedding_encoder_job is None:
+            _cp = ps.get_view_camera_parameters()
+            current_cam_state = np.concatenate([_cp.get_position(), _cp.get_up_dir()])
+            if self.embedding_last_camera_mat is not None and np.allclose(current_cam_state, self.embedding_last_camera_mat):
+                return
+            self.embedding_last_camera_mat = current_cam_state
+
             now = time.perf_counter()
             if now - self.embedding_loop_prevtime < self.embedding_loop_interval:
                 return
@@ -1331,7 +1338,6 @@ class PSGUI:
 
         self._embedding_pca_rgb = None
         self._embedding_pca_rgb_size = None
-        self._embedding_pca_bases = None
         self._embedding_cache_token += 1
         self.invalidate_heatmap_caches()
         self.embedding_encoder_job = None
