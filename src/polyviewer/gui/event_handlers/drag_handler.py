@@ -28,6 +28,7 @@ class DragHandler:
         gizmos_group.set_show_child_details(False)
         selection_rect.add_to_group(gizmos_group)
         self.is_dragging: bool = False
+        self.drag_just_finalized: bool = False
         self.lastMouseClick: Tuple[float, float] = None
         self.lastDragDelta = None
         self.navigation_style: Tuple[float, float] = None
@@ -93,6 +94,7 @@ class DragHandler:
         return x0, y0, x1, y1
 
     def handle_callback(self, payload: CallbackPayload):
+        self.drag_just_finalized = False
         io = psim.GetIO()
         drag_bounds = None
         finalize_selection = False
@@ -124,6 +126,7 @@ class DragHandler:
             else:
                 payload.selection_preview = GSplatSelection().select(payload)
             if finalize_selection:
+                self.drag_just_finalized = True
                 payload.last_selection = payload.selection_preview
 
     def is_drag_in_progress(self):

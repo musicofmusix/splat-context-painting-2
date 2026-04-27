@@ -72,7 +72,7 @@ class GUIConfig:
     enable_vsync: bool = False
     max_fps: int = -1
     background_color: Tuple = (0.0, 0.0, 0.0)
-    window_size: Tuple = (1920, 1080)
+    window_size: Tuple = (1280, 720)
 
 DEFAULT_CONFIG = GUIConfig(
     up_axis="neg_y_up", front_axis="neg_z_front", navigation_style="turntable"
@@ -254,28 +254,21 @@ class PSGUI:
         # higher = trust the past, lower = trust the present
         self.ema_alpha = 0.75
         self.segmentation_mode_enabled = False
+        self.morph_radius = 0.05
+        self.heatmap_downsample = 2     # spatial downsample factor before FFT (1=off, 2=4× speedup, 4=16× speedup)
+        self.heatmap_gamma: float = 5.0  # power applied to per-pixel percentile rank (1=linear, >1=exaggerate top)
+        self._seg_bbox_idx = None       # bbox gaussian indices from last segmentation
 
-        # segmentation BFS parameters
-        self.grow_radius = 0.05
-        self.similarity_threshold = 0.9
-        self.heatmap_threshold = 0.9
-        self.context_grow_radius = 0.04
         self.context_selection_mask = None
-        self.context_prototype = None
-        self._embedding_cache_token = 0
-        self._context_prototype_token = 0
         self._embedding_pca_rgb_size = None
-        self._heatmap_values = None
-        self._snap_heatmap_values = None
-        self._snap_heatmap_cache_size = None
-        self._heatmap_colors = None
-        self._heatmap_cache_size = None
-        self._heatmap_color_threshold = None
-        self._snap_candidates_mask = None
-        self._snap_candidates_idx = None
-        self._snap_candidates_screen_xy = None
-        self._snap_pos_3d = None
-        self._last_mouse_pos = None
+        self._emb_image_buffer: torch.Tensor = None    # embedding scatter buffer — context
+        self._emb_image_buffer_2: torch.Tensor = None  # embedding scatter buffer — scene
+        self._cached_context_mask = None
+        self._cached_context_pc = None
+        self._cached_scene_mask = None
+        self._cached_scene_pc = None
+        self._dino_pca_mean: torch.Tensor = None   # (DINO_DIM,)  fit on first DINO call
+        self._dino_pca_basis: torch.Tensor = None  # (DINO_DIM, EMBEDDING_DIM)
         ps.set_bounding_box(bbox_min - radius, bbox_max + radius)
         ps.init()
         
@@ -509,15 +502,75 @@ class PSGUI:
                 )
                 self.render_state.canvas_scalar_renderbuffer = None
 
-        if self.brush_manager.brush_gs is not None or self.context_prototype is not None:
+        if self.brush_manager.brush_gs is not None:
             query_depth, query_cam_dist = self.render_scene_query_buffers()
         else:
             query_depth, query_cam_dist = self.render_state.curr_depth, self.render_state.dist_cam
+
+        if style == "heatmap":
+            pc_context = self._filtered_pc_for_style("context")
+            pc_scene = self._filtered_pc_for_style("scene")
+            if pc_context is None or pc_scene is None:
+                ps.frame_tick()
+                return
+
+            # Single rasterisation — depth is shared across both scatter passes.
+            cam = polyscope_to_gsplat_camera(
+                None, downsample_factor=self.render_state.canvas_res_downsample
+            )
+            render_pkg = self.render_fn(
+                viewpoint_camera=cam, pc=pc_scene,
+                pipe=self.render_kwargs["pipe"],
+                bg_color=self.render_kwargs["bg_color"],
+            )
+            shared_depth = render_pkg["depth"][0]                          # H×W
+            scene_depth = shared_depth.unsqueeze(-1)                       # H×W×1
+
+            # Context scatter → _emb_image_buffer
+            _, context_emb, _, bbox = self.render_gaussians_with_embeddings(
+                pc_context, depth_override=shared_depth
+            )
+            if bbox is None:
+                ps.frame_tick()
+                return
+            y0, y1, x0, x1 = bbox
+            # No clone needed — scene scatter writes to a separate buffer
+            context_kernel = context_emb[:, y0:y1 + 1, x0:x1 + 1]        # D×kH×kW
+
+            # Scene scatter → _emb_image_buffer_2
+            _, scene_emb, _, _ = self.render_gaussians_with_embeddings(
+                pc_scene, depth_override=shared_depth, use_buffer_2=True
+            )
+
+            H_full, W_full = scene_emb.shape[1], scene_emb.shape[2]
+
+            # Normalised cross-correlation → grayscale similarity map
+            similarity = self._embedding_cross_correlation(scene_emb, context_kernel)
+
+            flat = similarity.flatten()
+            _, sort_idx = flat.sort()
+            ranks = flat.new_empty(flat.numel())
+            ranks[sort_idx] = torch.linspace(0.0, 1.0, flat.numel(), device=flat.device, dtype=flat.dtype)
+            similarity = ranks.reshape(similarity.shape).pow(self.heatmap_gamma)
+
+            # Zero out pixels where no scene gaussian was rendered
+            similarity = similarity * (shared_depth > 1e-4)
+
+            gray = similarity.unsqueeze(-1).expand(H_full, W_full, 3).contiguous()
+
+            self.render_state.curr_rb = gray
+            self.render_state.curr_depth = query_depth
+            self.render_state.dist_cam = query_cam_dist
+            gray_rgba = torch.cat((gray, torch.ones_like(gray[:, :, 0:1])), dim=-1)
+            self.render_state.canvas_color_renderbuffer.update_data_from_device(gray_rgba.detach())
+            self.render_state.canvas_depth_renderbuffer.update_data_from_device(scene_depth.detach())
+            ps.frame_tick()
+            return
+
         cam = polyscope_to_gsplat_camera(
             None, downsample_factor=self.render_state.canvas_res_downsample
         )
         display_pc = self.resolve_render_pc("render", composite_brush=True)
-        self.refresh_snap_candidates()
         style_override_color = self.get_render_style_color(display_pc, style)
         render_pkg = self.render_fn(
             viewpoint_camera=cam,
@@ -540,145 +593,6 @@ class PSGUI:
             self.render_state.canvas_color_renderbuffer.update_data_from_device(rb.detach())
             self.render_state.canvas_depth_renderbuffer.update_data_from_device(depth.detach())
         ps.frame_tick()
-
-    def refresh_snap_candidates(self):
-        """Compute snap candidates from scene pc every frame, independent of render style."""
-        if self.context_prototype is None:
-            self._snap_candidates_mask = None
-            self._snap_candidates_idx = None
-            self._snap_candidates_screen_xy = None
-            return
-        scene_pc = self.render_kwargs["pc"]
-        scene_valid = scene_pc._has_embedding.bool()
-        if self._snap_heatmap_values is None or self._snap_heatmap_cache_size != scene_pc._embedding.shape[0]:
-            self._snap_heatmap_values, _ = self.get_normalized_heatmap_similarity(scene_pc)
-            self._snap_heatmap_cache_size = scene_pc._embedding.shape[0]
-        self._snap_candidates_mask = self.compute_visible_valid_snap_mask(
-            scene_pc, self._snap_heatmap_values, scene_valid
-        )
-
-    def compute_visible_valid_snap_mask(self, pc, heatmap_values, valid):
-        """Returns [N] bool mask: above-threshold Gaussians that are depth-visible from the current camera."""
-        depth_buffer = self.render_state.curr_depth
-        if depth_buffer is None:
-            return None
-
-        above_threshold = valid & (heatmap_values >= self.heatmap_threshold)
-        if above_threshold.sum() == 0:
-            return above_threshold
-
-        W, H = ps.get_window_size()
-        W = W // self.render_state.canvas_res_downsample
-        H = H // self.render_state.canvas_res_downsample
-
-        # Project only the above-threshold subset: one matmul gives both screen xy and depth
-        above_xyz = pc._xyz.detach()[above_threshold]
-        K = above_xyz.shape[0]
-        gsplat_cam = polyscope_to_gsplat_camera(None)
-        mvp = gsplat_cam.full_proj_transform.T[None].expand(K, 4, 4)
-        proj = (mvp @ torch.cat([above_xyz, above_xyz.new_ones(K, 1)], dim=1).unsqueeze(-1)).squeeze(-1)
-        pre_ndc_depth = proj[:, 2]
-        screen_xy = proj[:, :2] / proj[:, 3:4]
-        x_coords = ((screen_xy[:, 0] + 1) / 2.0 * W).round().long()
-        y_coords = ((screen_xy[:, 1] + 1) / 2.0 * H).round().long()
-
-        z_h, z_w = depth_buffer.shape[0], depth_buffer.shape[1]
-        within_bounds = (
-            (x_coords >= 0) & (x_coords < z_w) &
-            (y_coords >= 0) & (y_coords < z_h) &
-            (pre_ndc_depth > 0.0)
-        )
-        z_match = within_bounds & (
-            torch.abs(pre_ndc_depth - depth_buffer[y_coords.clamp(0, z_h - 1), x_coords.clamp(0, z_w - 1)].squeeze()) < 1e-2
-        )
-
-        snap_mask = torch.zeros(pc._xyz.shape[0], dtype=torch.bool, device=pc._xyz.device)
-        snap_mask[above_threshold] = z_match
-
-        # Cache SS coords and indices for use in snapping logic
-        snap_idx = torch.nonzero(snap_mask, as_tuple=False).squeeze(1)
-        self._snap_candidates_idx = snap_idx
-        self._snap_candidates_screen_xy = (
-            torch.stack([x_coords[z_match].float(), y_coords[z_match].float()], dim=1)
-            if snap_idx.numel() > 0
-            else torch.zeros((0, 2), device=pc._xyz.device)
-        )
-
-        return snap_mask
-
-    def find_nearest_snap_candidate_ss(self, candidate_pixel, search_radius):
-        """Returns the scene Gaussian index of the nearest snap candidate within search_radius pixels, or None."""
-        if self._snap_candidates_screen_xy is None or self._snap_candidates_screen_xy.shape[0] == 0:
-            return None
-        cand_xy = self._snap_candidates_screen_xy.to(device=candidate_pixel.device, dtype=candidate_pixel.dtype)
-        dists = torch.norm(cand_xy - candidate_pixel.unsqueeze(0), dim=1)
-        min_dist, min_idx = dists.min(dim=0)
-        if min_dist.item() > search_radius:
-            return None
-        return self._snap_candidates_idx[min_idx].item()
-
-    def update_snap_pos(self):
-        """Continuity-first snapping: tracks the nearest visible valid Gaussian in screen space."""
-        io = psim.GetIO()
-        mouse_pos = psim.GetMousePos()
-        W, H = ps.get_window_size()
-
-        snapping_active = (
-            psim.IsKeyDown(psim.ImGuiKey_S)
-            and self.context_prototype is not None
-            and self._snap_candidates_idx is not None
-            and self._snap_candidates_idx.numel() > 0
-        )
-
-        if not snapping_active:
-            if self._snap_pos_3d is not None:
-                self._snap_pos_3d = None
-                ps.register_point_cloud("snap_target", np.zeros((0, 3)))
-            self._last_mouse_pos = None
-            return
-
-        mouse_delta = (0.0, 0.0)
-        if self._last_mouse_pos is not None:
-            mouse_delta = (
-                mouse_pos[0] - self._last_mouse_pos[0],
-                mouse_pos[1] - self._last_mouse_pos[1],
-            )
-        self._last_mouse_pos = mouse_pos
-
-        search_radius = 80.0  # pixels
-
-        # Build candidate pixel: project previous snap pos + mouse delta, or raw mouse if no prior snap
-        if self._snap_pos_3d is not None:
-            screen_xyz = project_gaussian_means_to_2d_pos(self._snap_pos_3d.unsqueeze(0), None)
-            snap_ss_x = float((screen_xyz[0, 0] + 1) / 2.0 * W) + mouse_delta[0]
-            snap_ss_y = float((screen_xyz[0, 1] + 1) / 2.0 * H) + mouse_delta[1]
-            candidate_pixel = torch.tensor(
-                [max(0.0, min(W - 1, snap_ss_x)), max(0.0, min(H - 1, snap_ss_y))],
-                device=DEFAULT_DEVICE, dtype=torch.float32,
-            )
-        else:
-            candidate_pixel = torch.tensor(
-                [float(mouse_pos[0]), float(mouse_pos[1])],
-                device=DEFAULT_DEVICE, dtype=torch.float32,
-            )
-
-        winner_idx = self.find_nearest_snap_candidate_ss(candidate_pixel, search_radius)
-
-        # Continuity fallback: if projected candidate failed, try raw mouse position
-        if winner_idx is None and self._snap_pos_3d is not None:
-            mouse_pixel = torch.tensor(
-                [float(mouse_pos[0]), float(mouse_pos[1])],
-                device=DEFAULT_DEVICE, dtype=torch.float32,
-            )
-            winner_idx = self.find_nearest_snap_candidate_ss(mouse_pixel, search_radius)
-
-        if winner_idx is not None:
-            self._snap_pos_3d = self.render_kwargs["pc"]._xyz[winner_idx].detach().clone()
-            dot = ps.register_point_cloud("snap_target", self._snap_pos_3d.cpu().numpy()[None], radius=0.005)
-            dot.set_color((0.0, 1.0, 0.4))
-        else:
-            self._snap_pos_3d = None
-            ps.register_point_cloud("snap_target", np.zeros((0, 3)))
 
     def get_render_style_color(self, pc, style):
         if style == "render":
@@ -714,29 +628,6 @@ class PSGUI:
                 self._embedding_pca_rgb_size = pc._embedding.shape[0]
 
             override_color[valid] = emb_rgb[valid].to(
-                device=override_color.device, dtype=override_color.dtype
-            )
-            return override_color
-
-        if style == "heatmap" and self.context_prototype is not None:
-            heatmap_values = self._heatmap_values
-            if heatmap_values is None or self._heatmap_cache_size != pc._embedding.shape[0]:
-                heatmap_values, _ = self.get_normalized_heatmap_similarity(pc)
-                self._heatmap_values = heatmap_values
-                self._heatmap_cache_size = pc._embedding.shape[0]
-
-            heatmap_colors = torch.zeros(
-                (pc._embedding.shape[0], 3),
-                device=pc._embedding.device,
-                dtype=torch.float32,
-            )
-            if self._snap_candidates_mask is not None:
-                n_scene = self._snap_candidates_mask.shape[0]
-                heatmap_colors[:n_scene][self._snap_candidates_mask] = 1.0
-            else:
-                above_threshold = valid & (heatmap_values >= self.heatmap_threshold)
-                heatmap_colors[above_threshold] = 1.0
-            override_color[valid] = heatmap_colors[valid].to(
                 device=override_color.device, dtype=override_color.dtype
             )
             return override_color
@@ -821,67 +712,15 @@ class PSGUI:
         self.update_selection_visualizations()
         return
 
-    def invalidate_heatmap_caches(self):
-        self._heatmap_values = None
-        self._snap_heatmap_values = None
-        self._snap_heatmap_cache_size = None
-        self._heatmap_colors = None
-        self._heatmap_cache_size = None
-
     def clear_context_selection(self):
         self.context_selection_mask = None
-        self.context_prototype = None
-        self._context_prototype_token += 1
-        self.invalidate_heatmap_caches()
         ps.register_point_cloud("context_xyz", np.zeros((0, 3)))
         context_pc = ps.get_point_cloud("context_xyz")
         context_pc.set_color((1.0, 1.0, 0.0))
 
     def recompute_context_selection(self):
-        scene = self.render_kwargs["pc"]
-        xyz = scene._xyz.detach()
-        selection = self.current_selection.mask
-
-        if selection is None or not torch.any(selection):
+        if self.current_selection.mask is None or not torch.any(self.current_selection.mask):
             self.context_selection_mask = None
-            self.context_prototype = None
-            self.invalidate_heatmap_caches()
-            return
-
-        has_embedding_full = scene._has_embedding.data.bool()
-        outside_selection = ~selection
-        context_selection = torch.zeros_like(selection)
-        selected_idx = torch.nonzero(selection, as_tuple=False).squeeze(1)
-
-        if selected_idx.numel() > 0:
-            selected_xyz = xyz[selected_idx]
-            all_idx = torch.arange(xyz.shape[0], device=DEFAULT_DEVICE)
-            outside_idx = all_idx[outside_selection & has_embedding_full]
-            outside_xyz = xyz[outside_idx]
-
-            if outside_idx.numel() > 0:
-                chunk_size = 128
-                near_boundary = torch.zeros(outside_idx.shape[0], dtype=torch.bool, device=DEFAULT_DEVICE)
-                chunk_start = 0
-                while chunk_start < selected_idx.shape[0]:
-                    selected_chunk = selected_xyz[chunk_start : chunk_start + chunk_size]
-                    chunk_start += chunk_size
-                    near_boundary |= (
-                        torch.cdist(selected_chunk, outside_xyz) <= self.context_grow_radius
-                    ).any(dim=0)
-
-                context_selection[outside_idx[near_boundary]] = True
-
-        self.context_selection_mask = context_selection
-        if torch.any(context_selection):
-            context_embeddings = scene._embedding.data[context_selection]
-            context_embeddings = torch.nn.functional.normalize(context_embeddings, dim=1)
-            prototype = context_embeddings.mean(dim=0, keepdim=True)
-            self.context_prototype = torch.nn.functional.normalize(prototype, dim=1).squeeze(0)
-        else:
-            self.context_prototype = None
-        self._context_prototype_token += 1
-        self.invalidate_heatmap_caches()
 
     def clear_selection(self):
         self.current_selection.reset()
@@ -920,23 +759,6 @@ class PSGUI:
         context_pc = ps.get_point_cloud("context_xyz")
         context_pc.set_color((1.0, 1.0, 0.0))
 
-    def get_normalized_heatmap_similarity(self, pc):
-        valid = pc._has_embedding.bool()
-        similarity = torch.zeros(
-            (pc._embedding.shape[0],), device=pc._embedding.device, dtype=torch.float32
-        )
-
-        if self.context_prototype is None or valid.sum().item() == 0:
-            return similarity, valid
-
-        embedding_norm = torch.nn.functional.normalize(pc._embedding[valid], dim=1)
-        prototype = self.context_prototype.to(
-            device=embedding_norm.device, dtype=embedding_norm.dtype
-        )
-        valid_similarity = torch.clamp(embedding_norm @ prototype, 0.0, 1.0)
-        similarity[valid] = valid_similarity
-        return similarity, valid
-
     # Brush setup / painting
     def save_brush(self, path_to_ply=None):
         if path_to_ply is None or not str(path_to_ply).strip():
@@ -948,10 +770,7 @@ class PSGUI:
         if selection is not None and torch.any(selection):
             selected_gs = copy.deepcopy(self.render_kwargs["pc"])
             apply_mask_to_attributes(selected_gs, selection.detach())
-            meta = {}
-            if self.context_prototype is not None:
-                meta["prototype_embedding"] = self.context_prototype.detach().cpu()
-            export_brush(save_path, selected_gs, meta=meta if len(meta) > 0 else None)
+            export_brush(save_path, selected_gs, meta=None)
             return
 
         self.brush_manager.save_brush(path_to_ply)
@@ -960,18 +779,6 @@ class PSGUI:
         self.brush_stroke_gs = None
         self.ui_state.display_mode_idx = 0
         self.brush_manager.load_brush(path_to_ply)
-        _, brush_meta, _ = import_brush(os.path.join(os.getcwd(), path_to_ply))
-        prototype_embedding = None if brush_meta is None else brush_meta.get("prototype_embedding")
-        if prototype_embedding is not None:
-            if not torch.is_tensor(prototype_embedding):
-                prototype_embedding = torch.tensor(prototype_embedding, dtype=torch.float32)
-            self.context_prototype = prototype_embedding.detach().to(
-                device=DEFAULT_DEVICE, dtype=torch.float32
-            )
-        else:
-            self.context_prototype = None
-        self._context_prototype_token += 1
-        self.invalidate_heatmap_caches()
         self.segments = self.init_segments()
 
     def clip_points(self, points, clip=True):
@@ -1104,6 +911,7 @@ class PSGUI:
                 [self.render_kwargs["pc"], self.brush_stroke_gs]
             )
             self.model = self.render_kwargs["pc"]
+            self._invalidate_filtered_pc_cache()
             self.segments: Dict[str, Segment] = self.init_segments()
             self.brush_stroke_gs = self.brush_manager.brush_gs
         return
@@ -1112,14 +920,6 @@ class PSGUI:
         mouse_pos = psim.GetMousePos()
         window_w, window_h = ps.get_window_size()
 
-        if self._snap_pos_3d is not None:
-            screen_xyz = project_gaussian_means_to_2d_pos(self._snap_pos_3d.unsqueeze(0), None)
-            snap_ss_x = float((screen_xyz[0, 0] + 1) / 2.0 * window_w)
-            snap_ss_y = float((screen_xyz[0, 1] + 1) / 2.0 * window_h)
-            mouse_pos = (
-                max(0.0, min(float(window_w - 1), snap_ss_x)),
-                max(0.0, min(float(window_h - 1), snap_ss_y)),
-            )
         if self.render_state.curr_depth is not None:
             depth_render = self.render_state.curr_depth
         else:
@@ -1128,11 +928,12 @@ class PSGUI:
             cam_dist_render = self.render_state.dist_cam
         else:
             cam_dist_render = self.render_gaussians("dist_to_cam")
+        render_h, render_w = cam_dist_render.shape[:2]
         if (
             mouse_pos[0] < 0
-            or mouse_pos[0] >= window_w
+            or mouse_pos[0] >= render_w
             or mouse_pos[1] < 0
-            or mouse_pos[1] >= window_h
+            or mouse_pos[1] >= render_h
         ):
             return
         cam_dist = cam_dist_render[int(mouse_pos[1]), int(mouse_pos[0])]
@@ -1260,12 +1061,29 @@ class PSGUI:
         patch_embeddings = patch_embeddings.squeeze(0).to(DEFAULT_DEVICE)
 
         # embeddings are not image size for patched encoders. need to scale then sample.
-        patch_h, patch_w, _ = patch_embeddings.shape
-        patch_y = torch.clamp((ys.float() * patch_h / max(h, 1)).floor().long(), 0, patch_h - 1)
-        patch_x = torch.clamp((xs.float() * patch_w / max(w, 1)).floor().long(), 0, patch_w - 1)
+        patch_h, patch_w, embed_dim = patch_embeddings.shape
+        # grid_sample expects (1, D, H, W); normalise pixel coords to [-1, 1] at patch-cell centres
+        grid_x = (xs.float() + 0.5) / w * 2.0 - 1.0
+        grid_y = (ys.float() + 0.5) / h * 2.0 - 1.0
+        grid = torch.stack([grid_x, grid_y], dim=-1).view(1, 1, -1, 2)
+        feat_map = patch_embeddings.permute(2, 0, 1).unsqueeze(0)  # (1, D, pH, pW)
+        # size MxDINO_DIM embeddings for visible gaussians (raw 384-dim)
+        sampled_embeddings = torch.nn.functional.grid_sample(
+            feat_map, grid, mode="bilinear", align_corners=False
+        ).squeeze(0).squeeze(1).T  # (M, DINO_DIM)
 
-        # size MxD embeddings for visual gaussians
-        sampled_embeddings = patch_embeddings[patch_y, patch_x]
+        # --- PCA projection 384 → EMBEDDING_DIM ---
+        target_dim = scene._embedding.shape[1]
+        if self._dino_pca_basis is None:
+            if sampled_embeddings.shape[0] < target_dim:
+                # Too few visible gaussians to fit a reliable PCA; skip this frame.
+                return int(visible.sum().item())
+            mean = sampled_embeddings.mean(0)
+            _, _, V = torch.pca_lowrank(sampled_embeddings - mean, q=target_dim, niter=4)
+            self._dino_pca_mean = mean          # (DINO_DIM,)
+            self._dino_pca_basis = V            # (DINO_DIM, EMBEDDING_DIM)
+            print(f"[dino pca] fitted {target_dim}-dim basis from {sampled_embeddings.shape[0]} embeddings")
+        sampled_embeddings = (sampled_embeddings - self._dino_pca_mean) @ self._dino_pca_basis  # (M, EMBEDDING_DIM)
 
         with torch.no_grad():
             # for entries that are both visible AND already has embeddings, use EMA to update
@@ -1305,8 +1123,7 @@ class PSGUI:
 
             # PART1: snapshot current view (sync)
             scene = self.render_kwargs["pc"]
-            projected = project_gaussian_means_to_2d_pos(scene._xyz.detach(), None)
-            pre_ndc_depth = project_gaussian_means_to_2d_pre_ndc_depth(scene, None)
+            projected, pre_ndc_depth = project_gaussian_means_to_2d_pos_and_depth(scene, None)
             rgb, depth = self.render_gaussians("passthrough", composite_brush=False)
             rgb_np = rgb.detach().cpu().numpy()
 
@@ -1338,95 +1155,298 @@ class PSGUI:
 
         self._embedding_pca_rgb = None
         self._embedding_pca_rgb_size = None
-        self._embedding_cache_token += 1
-        self.invalidate_heatmap_caches()
         self.embedding_encoder_job = None
         self.embedding_scene_snapshot = None
 
     @torch.no_grad()
-    # all masks operate in the full N gaussian array space, for readability
-    # although, one might want to operate in M has-embedding space for speed later
-    def handle_segmentation_click(self):
-        if not self.segmentation_mode_enabled:
+    def handle_segmentation_bbox(self, ndc_bounds):
+        x0, y0, x1, y1 = ndc_bounds
+        scene = self.render_kwargs["pc"]
+
+        has_embedding = scene._has_embedding.data.bool()
+        if not torch.any(has_embedding):
             return
+
+        # project all gaussians to NDC and keep those inside the bbox with embeddings
+        ndc = project_gaussian_means_to_2d_pos(scene._xyz.detach(), None)
+        in_bbox = (
+            (ndc[:, 0] >= x0) & (ndc[:, 0] <= x1) &
+            (ndc[:, 1] >= y0) & (ndc[:, 1] <= y1) &
+            has_embedding
+        )
+        bbox_idx = torch.nonzero(in_bbox, as_tuple=False).squeeze(1)
+        if bbox_idx.numel() < 2:
+            return
+
+        bbox_emb = torch.nn.functional.normalize(scene._embedding.data[bbox_idx], dim=1)
+
+        # k-means(2): init with the most-central gaussian and its most dissimilar peer
+        bbox_ndc_pos = ndc[bbox_idx, :2]
+        bbox_center = torch.tensor([(x0 + x1) / 2, (y0 + y1) / 2], device=DEFAULT_DEVICE)
+        ca = (bbox_ndc_pos - bbox_center).norm(dim=1).argmin().item()
+        cb = (bbox_emb @ bbox_emb[ca]).argmin().item()
+        centroids = torch.stack([bbox_emb[ca], bbox_emb[cb]])
+
+        labels = torch.zeros(bbox_idx.numel(), dtype=torch.long, device=DEFAULT_DEVICE)
+        for _ in range(10):
+            labels = (bbox_emb @ centroids.T).argmax(dim=1)
+            new_centroids = torch.stack([
+                torch.nn.functional.normalize(
+                    bbox_emb[labels == k].mean(dim=0, keepdim=True) if (labels == k).any() else centroids[k:k+1],
+                    dim=1,
+                ).squeeze(0)
+                for k in range(2)
+            ])
+            if torch.allclose(centroids, new_centroids, atol=1e-5):
+                break
+            centroids = new_centroids
+
+        # foreground = cluster whose mean screen position is closest to the bbox center
+        cluster_centers = torch.stack([
+            bbox_ndc_pos[labels == k].mean(dim=0) if (labels == k).any() else bbox_center
+            for k in range(2)
+        ])
+        fg = (cluster_centers - bbox_center).norm(dim=1).argmin().item()
+        bg = 1 - fg
+
+        # select the foreground cluster
+        selection = torch.zeros(scene._xyz.shape[0], dtype=torch.bool, device=DEFAULT_DEVICE)
+        selection[bbox_idx[labels == fg]] = True
 
         io = psim.GetIO()
-        if io.WantCaptureMouse or not psim.IsMouseClicked(psim.ImGuiMouseButton_Left):
-            return
-
-        if self.render_state.curr_depth is not None:
-            depth_render = self.render_state.curr_depth
-        else:
-            depth_render = self.render_gaussians("depth", composite_brush=False)
-
-        # select all surface gaussians within a small 2D radius around the mouse cursor
-        mask = get_minimal_surface_mask_3d(
-            psim.GetMousePos(), 5, self.render_kwargs["pc"], depth_render
-        )
-
-        hit_idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
-        if hit_idx.numel() == 0:
-            return
-
-        scene = self.render_kwargs["pc"]
-        if not torch.any(scene._has_embedding.data[hit_idx]):
-            return
-
-        # prepare masks
-        has_embedding = scene._has_embedding.data.bool()
-        has_embedding_idx = torch.nonzero(has_embedding, as_tuple=False).squeeze(1)
-        hit_has_embedding_idx = hit_idx[has_embedding[hit_idx]]
-        xyz = scene._xyz.detach()
-
-        # prepare the single seed vector to grow our selection from
-        median_embedding = torch.median(scene._embedding.data[hit_has_embedding_idx], dim=0).values
-        seed = torch.nn.functional.normalize(median_embedding.unsqueeze(0), dim=1).squeeze(0)
-
-        # normalise all embeddings
-        embedding_norm = torch.nn.functional.normalize(scene._embedding.data[has_embedding], dim=1)
-
-        # all gaussians with an embedding that exceed the similarity threshold
-        candidates_idx = has_embedding_idx[(embedding_norm @ seed) >= self.similarity_threshold]
-        candidates_xyz = xyz[candidates_idx]
-
-        # build BFS frontier; start with our initial hit gaussians
-        frontier_idx = hit_has_embedding_idx
-        # smaller = faster but less accurate
-        frontier_chunk_size = 128
-
-        # selected gaussians
-        selection = torch.zeros(xyz.shape[0], dtype=torch.bool, device=DEFAULT_DEVICE)
-        selection[frontier_idx] = True
-
-        # run wave-based BFS
-        # each wave is split into chunks, to lessen the impact of O(N^2) cdist
-        while frontier_idx.numel() > 0:
-            near_candidate = torch.zeros(candidates_idx.shape[0], dtype=torch.bool, device=DEFAULT_DEVICE)
-
-            chunk_start = 0
-            while chunk_start < frontier_idx.shape[0]:
-                frontier_chunk = frontier_idx[chunk_start : chunk_start + frontier_chunk_size]
-                chunk_start += frontier_chunk_size
-
-                frontier_xyz = xyz[frontier_chunk]
-
-                # check which candidates lie within the radius of ANY frontier point in this chunk
-                chunk_near_candidate = torch.cdist(frontier_xyz, candidates_xyz) <= self.grow_radius
-                near_candidate |= chunk_near_candidate.any(dim=0)
-
-            # accept all candidates reached in this wave that are not selected yet
-            accepted_candidates_idx = candidates_idx[near_candidate & ~selection[candidates_idx]]
-            selection[accepted_candidates_idx] = True
-            frontier_idx = accepted_candidates_idx
-
         if io.KeyShift and self.current_selection.mask is not None:
             selection = selection | self.current_selection.mask
 
         self.current_selection.set_mask(selection)
         self.selection_identifier = self.current_selection.identifier.detach().cpu().numpy()
 
-        self.recompute_context_selection()
+        # context = background cluster from k-means
+        bg_idx = bbox_idx[labels == bg]
+        context_mask = torch.zeros(scene._xyz.shape[0], dtype=torch.bool, device=DEFAULT_DEVICE)
+        context_mask[bg_idx] = True
+        self.context_selection_mask = context_mask
+
+        self._seg_bbox_idx = bbox_idx
+
         self.update_bbox_from_selection()
+
+    @torch.no_grad()
+    def morph_mask(self, context: bool = False):
+        mask = self.context_selection_mask if context else self.current_selection.mask
+        if mask is None or not torch.any(mask):
+            return
+        if self._seg_bbox_idx is None:
+            return
+        xyz = self.render_kwargs["pc"]._xyz.detach()
+
+        bbox_idx = self._seg_bbox_idx
+        bbox_mask = mask[bbox_idx]
+        bbox_xyz = xyz[bbox_idx]
+
+        test_local_idx = torch.nonzero(bbox_mask, as_tuple=False).squeeze(1)
+        if test_local_idx.numel() == 0:
+            return
+
+        new_mask = mask.clone()
+        chunk_size = 512
+
+        for start in range(0, test_local_idx.shape[0], chunk_size):
+            chunk_local = test_local_idx[start:start + chunk_size]
+            chunk_global = bbox_idx[chunk_local]
+
+            dists = torch.cdist(bbox_xyz[chunk_local], bbox_xyz)
+            in_radius = dists <= self.morph_radius
+            in_radius[torch.arange(chunk_local.shape[0], device=DEFAULT_DEVICE), chunk_local] = False
+
+            n_total = in_radius.sum(dim=1).float()
+            n_in    = (in_radius & bbox_mask.unsqueeze(0)).sum(dim=1).float()
+
+            has_neighbors = n_total > 0
+            fraction = torch.where(has_neighbors, n_in / n_total, torch.zeros_like(n_in))
+            new_mask[chunk_global[has_neighbors & (fraction < 0.5)]] = False
+
+        if context:
+            self.context_selection_mask = new_mask
+            self.update_selection_visualizations()
+        else:
+            self.current_selection.set_mask(new_mask)
+            self.selection_identifier = self.current_selection.identifier.detach().cpu().numpy()
+            self.update_bbox_from_selection()
+
+    @torch.no_grad()
+    def swap_selection_context(self):
+        if self.current_selection.mask is None or self.context_selection_mask is None:
+            return
+        old_selection = self.current_selection.mask.clone()
+        old_context = self.context_selection_mask.clone()
+
+        self.current_selection.set_mask(old_context)
+        self.selection_identifier = self.current_selection.identifier.detach().cpu().numpy()
+        self.context_selection_mask = old_selection
+
+        self.update_bbox_from_selection()
+
+    # Context / scene rendering
+    @torch.no_grad()
+    def render_gaussians_with_embeddings(self, pc, depth_override=None, use_buffer_2=False):
+        """Render pc from the current camera and scatter per-gaussian embeddings to a D×H×W image.
+
+        depth_override: if provided (H×W CUDA tensor), skips render_fn entirely and uses this
+            depth buffer for the scatter z-test.  rgb is returned as None in that case.
+            Useful in heatmap mode where a single rasterisation is shared across both scatter passes.
+        use_buffer_2: write into self._emb_image_buffer_2 instead of self._emb_image_buffer so
+            context and scene embeddings coexist in memory without an extra clone.
+
+        Returns (rgb | None, emb: D×H×W, depth: H×W×1, pixel_bbox | None).
+        """
+        cam = polyscope_to_gsplat_camera(
+            None, downsample_factor=self.render_state.canvas_res_downsample
+        )
+
+        if depth_override is None:
+            rgb_pkg = self.render_fn(
+                viewpoint_camera=cam, pc=pc, pipe=self.render_kwargs["pipe"],
+                bg_color=self.render_kwargs["bg_color"],
+            )
+            rgb = rgb_pkg["render"].permute(1, 2, 0).contiguous()
+            depth = rgb_pkg["depth"][0]                              # H×W
+            depth_1hw = depth.unsqueeze(-1)                         # H×W×1
+        else:
+            rgb = None
+            depth = depth_override                                   # H×W
+            depth_1hw = depth.unsqueeze(-1)                         # H×W×1
+
+        H, W = depth.shape
+        EMBED_DIM = pc._embedding.shape[1]
+
+        projected, pre_ndc_depth = project_gaussian_means_to_2d_pos_and_depth(pc, None)
+
+        x_coords = (((projected[:, 0] + 1.0) / 2.0) * W).round().long()
+        y_coords = (((projected[:, 1] + 1.0) / 2.0) * H).round().long()
+
+        has_emb = pc._has_embedding.bool()
+        within_bounds = (
+            (x_coords >= 0) & (x_coords < W) &
+            (y_coords >= 0) & (y_coords < H) &
+            (pre_ndc_depth > 0.0) &
+            has_emb
+        )
+
+        buf_attr = '_emb_image_buffer_2' if use_buffer_2 else '_emb_image_buffer'
+        desired_shape = (EMBED_DIM, H, W)
+        buf = getattr(self, buf_attr)
+        if buf is None or buf.shape != desired_shape:
+            buf = torch.empty(desired_shape, device=pc._embedding.device, dtype=torch.float32)
+            setattr(self, buf_attr, buf)
+        buf.zero_()
+
+        pixel_bbox = None
+        wb_idx = torch.nonzero(within_bounds, as_tuple=False).squeeze(1)
+        if wb_idx.numel() > 0:
+            ys = y_coords[wb_idx]
+            xs = x_coords[wb_idx]
+            z_match = torch.abs(pre_ndc_depth[wb_idx] - depth[ys, xs]) < 0.01
+            vis_idx = wb_idx[z_match]
+            if vis_idx.numel() > 0:
+                ys_v, xs_v = y_coords[vis_idx], x_coords[vis_idx]
+                order = torch.argsort(pre_ndc_depth[vis_idx], descending=True)
+                buf[:, ys_v[order], xs_v[order]] = pc._embedding.data[vis_idx[order]].float().T
+                pixel_bbox = (
+                    ys_v.min().item(), ys_v.max().item(),
+                    xs_v.min().item(), xs_v.max().item(),
+                )
+
+        return rgb, buf, depth_1hw, pixel_bbox
+
+    def _embedding_cross_correlation(self, scene_emb, context_emb):
+        """Sliding-window normalised cross-correlation between scene and context embedding images.
+
+        scene_emb:   D×H×W CUDA float tensor
+        context_emb: D×kH×kW CUDA float tensor (cropped context region)
+
+        Returns H×W CUDA float tensor where each value is the average per-active-pixel
+        cosine similarity between the context kernel and the local scene window.
+        Dividing by the geometric mean of active pixel counts makes the score
+        zoom-invariant: it no longer grows/shrinks with gaussian density or kernel size.
+
+        With D=EMBEDDING_DIM this is two batched rfft2 pairs — no channel loop.
+        """
+        D, H, W = scene_emb.shape
+        _, kH, kW = context_emb.shape
+
+        # Per-pixel L2 normalisation along D so every foreground pixel is a unit vector.
+        scene_norm = torch.nn.functional.normalize(scene_emb.float(), dim=0)
+        context_norm = torch.nn.functional.normalize(context_emb.float(), dim=0)
+
+        # --- raw correlation (sum of per-pixel cosine similarities) ---
+        context_pad = scene_norm.new_zeros(D, H, W)
+        context_pad[:, :kH, :kW] = context_norm
+        # Shift kernel center to (0,0) so the peak lands at the matching region center.
+        context_pad = torch.roll(context_pad, shifts=(-(kH // 2), -(kW // 2)), dims=(1, 2))
+        scene_f = torch.fft.rfft2(scene_norm)
+        corr_f = (torch.fft.rfft2(context_pad).conj() * scene_f).sum(0)
+        correlation = torch.fft.irfft2(corr_f, s=(H, W))  # H×W
+
+        # --- sliding-window active-pixel counts for the NCC denominator ---
+        # n_kernel_active: number of foreground (non-zero) pixels in the context kernel.
+        kernel_fg = (context_norm.norm(dim=0) > 1e-6).float()  # kH×kW foreground mask
+        n_kernel_active = kernel_fg.sum().clamp_min(1.0)
+
+        # local_scene_active_under_fg: for each candidate position, how many non-zero scene
+        # pixels fall at positions where the context kernel is also non-zero.
+        # Using the kernel foreground mask (not a flat ones-kernel) means hole/transparent
+        # pixels in the context are excluded from the denominator, matching their exclusion
+        # from the numerator.
+        scene_active = (scene_norm.norm(dim=0) > 1e-6).float()  # H×W binary mask
+        kernel_fg_pad = scene_active.new_zeros(H, W)
+        kernel_fg_pad[:kH, :kW] = kernel_fg
+        kernel_fg_pad = torch.roll(kernel_fg_pad, shifts=(-(kH // 2), -(kW // 2)), dims=(0, 1))
+        local_scene_active = torch.fft.irfft2(
+            torch.fft.rfft2(kernel_fg_pad).conj() * torch.fft.rfft2(scene_active), s=(H, W)
+        ).round().clamp_min(1.0)  # round away FFT ringing; require ≥1 active pixel per window
+
+        # NCC = raw_correlation / sqrt(n_kernel_active × local_scene_active_under_fg)
+        return correlation / (n_kernel_active * local_scene_active).sqrt()
+
+    def _invalidate_filtered_pc_cache(self):
+        self._cached_context_mask = None
+        self._cached_context_pc = None
+        self._cached_scene_mask = None
+        self._cached_scene_pc = None
+
+    def _filtered_pc_for_style(self, style):
+        """Return a cached filtered GaussianModel for context/scene styles, or None if no selection.
+
+        Cache is keyed on mask tensor identity — masks are always replaced, never mutated,
+        so an `is` check is a reliable zero-cost hit test.
+        """
+        pc_full = self.render_kwargs["pc"]
+        if style == "context":
+            mask = self.context_selection_mask
+            if mask is None or not torch.any(mask):
+                return None
+            if mask is not self._cached_context_mask:
+                pc = copy.deepcopy(pc_full)
+                apply_mask_to_attributes(pc, mask.bool())
+                self._cached_context_mask = mask
+                self._cached_context_pc = pc
+            return self._cached_context_pc
+        elif style == "scene":
+            subject_mask = self.current_selection.mask
+            N = pc_full._xyz.shape[0]
+            if subject_mask is not None and torch.any(subject_mask):
+                scene_mask = ~subject_mask.bool()
+            else:
+                scene_mask = None
+            if subject_mask is not self._cached_scene_mask:
+                pc = copy.deepcopy(pc_full)
+                if scene_mask is not None:
+                    apply_mask_to_attributes(pc, scene_mask)
+                self._cached_scene_mask = subject_mask
+                self._cached_scene_pc = pc
+            return self._cached_scene_pc
+        return None
+
 
     # UI / interaction
     def draw_render_panel(self):
@@ -1442,9 +1462,15 @@ class PSGUI:
                 if brush_change:
                     self.load_brush(self.ui_state.supported_brush_paths[self.ui_state.selected_brush])
 
+            if self.ui_constants.SUPPORTED_RENDER_MODES[self.ui_state.render_mode_idx] == "heatmap":
+                _, self.heatmap_gamma = psim.SliderFloat(
+                    "Heatmap gamma", self.heatmap_gamma, v_min=1.0, v_max=10.0
+                )
+
             if psim.Button("Undo"):
                 if self.prev_scene is not None:
                     self.render_kwargs["pc"] = self.prev_scene
+                    self._invalidate_filtered_pc_cache()
 
             _, self.embedding_loop_enabled = psim.Checkbox(
                 "Embedding Loop", self.embedding_loop_enabled
@@ -1460,21 +1486,20 @@ class PSGUI:
             if overlays_changed:
                 self.update_selection_visualizations()
 
+            _, self.morph_radius = psim.SliderFloat(
+                "Morph Radius", self.morph_radius, v_min=0.001, v_max=0.25
+            )
+            if psim.Button("Erode Subject"):
+                self.morph_mask()
+            psim.SameLine()
+            if psim.Button("Erode Context"):
+                self.morph_mask(context=True)
+            psim.SameLine()
+            if psim.Button("Swap FG/BG"):
+                self.swap_selection_context()
+
             if psim.Button("Clear Selection"):
                 self.clear_selection()
-
-            _, self.grow_radius = psim.SliderFloat(
-                "Selection Radius", self.grow_radius, v_min=0.001, v_max=0.25
-            )
-            _, self.similarity_threshold = psim.SliderFloat(
-                "Similarity Threshold", self.similarity_threshold, v_min=0.0, v_max=1.0
-            )
-            _, self.heatmap_threshold = psim.SliderFloat(
-                "Heatmap Threshold", self.heatmap_threshold, v_min=0.0, v_max=1.0
-            )
-            _, self.context_grow_radius = psim.SliderFloat(
-                "Context Radius", self.context_grow_radius, v_min=0.001, v_max=0.25
-            )
 
             psim.PopItemWidth()
             psim.TreePop()
@@ -1485,6 +1510,7 @@ class PSGUI:
                 gaussians = GaussianModel(3)
                 gaussians.load_ply(self.ui_state.scene_path)
                 self.render_kwargs["pc"] = gaussians
+                self._invalidate_filtered_pc_cache()
             if psim.Button("Save Scene"):
                 self.render_kwargs["pc"].save_ply(
                     os.path.join("asset_data/current_scene.ply")
@@ -1641,7 +1667,6 @@ class PSGUI:
 
         self.draw_brush_parameters_panel()
         self.handle_key_bindings()
-        self.update_snap_pos()
 
         if self.brush_edit_mode:
             self.transform_brush(self.gizmo)
@@ -1657,11 +1682,11 @@ class PSGUI:
         if self.brush_manager.brush_gs is not None:
             self.visualize_pca() 
 
-        self.handle_segmentation_click()
-
         with torch.no_grad():
             self.drag_handler.handle_callback(payload)
-            if (
+            if self.segmentation_mode_enabled and self.drag_handler.drag_just_finalized:
+                self.handle_segmentation_bbox(payload.drag_bounds)
+            elif (
                 payload.last_selection.identifier.detach().cpu().numpy()
                 != self.selection_identifier
                 and not self.drag_handler.is_drag_in_progress()

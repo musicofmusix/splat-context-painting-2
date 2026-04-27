@@ -104,6 +104,20 @@ def project_gaussian_means_to_2d(model: GaussianModel, camera: ps.CameraParamete
     return transformed_xyz
 
 
+def project_gaussian_means_to_2d_pos_and_depth(
+    model: GaussianModel, camera: ps.CameraParameters
+):
+    gaussians_pos = model.get_xyz.detach()
+    N = gaussians_pos.shape[0]
+    ones_padding = gaussians_pos.new_ones(N, 1)
+    xyz_homogeneous = torch.cat([gaussians_pos, ones_padding], dim=1).unsqueeze(-1)
+    gsplat_cam = polyscope_to_gsplat_camera(camera)
+    clip = (gsplat_cam.full_proj_transform.T[None].expand(N, 4, 4) @ xyz_homogeneous).squeeze(-1)
+    pre_ndc_depth = clip[:, 2]
+    ndc = clip / clip[:, -1:].clone()
+    return ndc, pre_ndc_depth
+
+
 def project_gaussian_means_to_2d_pos(gaussians_pos, camera: ps.CameraParameters):
     N = gaussians_pos.shape[0]
     ones_padding = gaussians_pos.new_ones(N, 1)
