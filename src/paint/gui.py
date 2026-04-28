@@ -253,20 +253,21 @@ class PSGUI:
         # embedding update exponential moving average param
         # higher = trust the past, lower = trust the present
         self.ema_alpha = 0.75
-        self.segmentation_mode_enabled = False
         self.morph_radius = 0.05
         self.heatmap_downsample = 2     # spatial downsample factor before FFT (1=off, 2=4× speedup, 4=16× speedup)
         self.heatmap_gamma: float = 5.0  # power applied to per-pixel percentile rank (1=linear, >1=exaggerate top)
-        self._seg_bbox_idx = None       # bbox gaussian indices from last segmentation
+        self._seg_bbox_idx = None
 
         self.context_selection_mask = None
         self._embedding_pca_rgb_size = None
         self._emb_image_buffer: torch.Tensor = None    # embedding scatter buffer — context
         self._emb_image_buffer_2: torch.Tensor = None  # embedding scatter buffer — scene
+
         self._cached_context_mask = None
         self._cached_context_pc = None
         self._cached_scene_mask = None
         self._cached_scene_pc = None
+        self._cached_heatmap_per_gaussian = None
         self._dino_pca_mean: torch.Tensor = None   # (DINO_DIM,)  fit on first DINO call
         self._dino_pca_basis: torch.Tensor = None  # (DINO_DIM, EMBEDDING_DIM)
         ps.set_bounding_box(bbox_min - radius, bbox_max + radius)
@@ -556,13 +557,30 @@ class PSGUI:
             # Zero out pixels where no scene gaussian was rendered
             similarity = similarity * (shared_depth > 1e-4)
 
-            gray = similarity.unsqueeze(-1).expand(H_full, W_full, 3).contiguous()
+            scene = self.render_kwargs["pc"]
+            override_color = self.backproject_heatmap(similarity, shared_depth)
 
-            self.render_state.curr_rb = gray
+            heatmap_per_gaussian = torch.full(
+                (scene._xyz.shape[0],), float('nan'), device=DEFAULT_DEVICE
+            )
+            vis_mask = override_color[:, 0] != 0
+            heatmap_per_gaussian[vis_mask] = override_color[vis_mask, 0]
+            self._cached_heatmap_per_gaussian = heatmap_per_gaussian
+
+            black_bg = torch.zeros(3, device=DEFAULT_DEVICE)
+            render_pkg_out = self.render_fn(
+                viewpoint_camera=cam, pc=scene,
+                pipe=self.render_kwargs["pipe"],
+                bg_color=black_bg,
+                override_color=override_color,
+            )
+            rgb_out = render_pkg_out["render"].permute(1, 2, 0).contiguous()
+
+            self.render_state.curr_rb = rgb_out
             self.render_state.curr_depth = query_depth
             self.render_state.dist_cam = query_cam_dist
-            gray_rgba = torch.cat((gray, torch.ones_like(gray[:, :, 0:1])), dim=-1)
-            self.render_state.canvas_color_renderbuffer.update_data_from_device(gray_rgba.detach())
+            rgb_rgba = torch.cat((rgb_out, torch.ones_like(rgb_out[:, :, 0:1])), dim=-1)
+            self.render_state.canvas_color_renderbuffer.update_data_from_device(rgb_rgba.detach())
             self.render_state.canvas_depth_renderbuffer.update_data_from_device(scene_depth.detach())
             ps.frame_tick()
             return
@@ -774,6 +792,52 @@ class PSGUI:
             return
 
         self.brush_manager.save_brush(path_to_ply)
+
+    def save_heatmap_snapshot(self):
+        import datetime
+        pc = self.render_kwargs["pc"]
+        N = pc._xyz.shape[0]
+
+        data = {
+            "xyz":              pc._xyz.detach().cpu().numpy(),
+            "features_dc":      pc._features_dc.detach().cpu().numpy(),
+            "features_rest":    pc._features_rest.detach().cpu().numpy(),
+            "scaling":          pc._scaling.detach().cpu().numpy(),
+            "rotation":         pc._rotation.detach().cpu().numpy(),
+            "opacity":          pc._opacity.detach().cpu().numpy(),
+            "active_sh_degree": np.array(pc.active_sh_degree),
+            "max_sh_degree":    np.array(pc.max_sh_degree),
+            "spatial_lr_scale": np.array(pc.spatial_lr_scale),
+        }
+
+        emb = pc._embedding.detach().cpu().numpy().copy()
+        no_emb = ~pc._has_embedding.bool().cpu().numpy()
+        emb[no_emb] = np.nan
+        data["embeddings"] = emb
+
+        if self._cached_heatmap_per_gaussian is not None:
+            data["heatmap_values"] = self._cached_heatmap_per_gaussian.cpu().numpy()
+        else:
+            data["heatmap_values"] = np.full(N, np.nan, dtype=np.float32)
+
+        if self.current_selection.mask is not None:
+            data["subject_indices"] = torch.nonzero(
+                self.current_selection.mask, as_tuple=False
+            ).squeeze(1).cpu().numpy()
+        else:
+            data["subject_indices"] = np.array([], dtype=np.int64)
+
+        if self.context_selection_mask is not None:
+            data["context_indices"] = torch.nonzero(
+                self.context_selection_mask, as_tuple=False
+            ).squeeze(1).cpu().numpy()
+        else:
+            data["context_indices"] = np.array([], dtype=np.int64)
+
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = f"heatmap_snapshot_{ts}.npz"
+        np.savez_compressed(path, **data)
+        print(f"Snapshot saved at {path}")
 
     def load_brush(self, path_to_ply):
         self.brush_stroke_gs = None
@@ -1107,6 +1171,37 @@ class PSGUI:
         return int(visible.sum().item())
 
     @torch.no_grad()
+    def backproject_heatmap(self, similarity, shared_depth):
+        """Backproject similarity map onto first-hit gaussians. Returns (N, 3) override_color."""
+        scene = self.render_kwargs["pc"]
+        N = scene._xyz.shape[0]
+        H, W = shared_depth.shape
+
+        override_color = torch.zeros(N, 3, device=DEFAULT_DEVICE, dtype=torch.float32)
+
+        projected, pre_ndc_depth = project_gaussian_means_to_2d_pos_and_depth(scene, None)
+        x_coords = (((projected[:, 0] + 1.0) / 2.0) * W).round().long()
+        y_coords = (((projected[:, 1] + 1.0) / 2.0) * H).round().long()
+
+        within_bounds = (
+            (x_coords >= 0) & (x_coords < W) &
+            (y_coords >= 0) & (y_coords < H) &
+            (pre_ndc_depth > 0.0)
+        )
+        if within_bounds.sum() == 0:
+            return override_color
+
+        wb_idx = torch.nonzero(within_bounds, as_tuple=False).squeeze(1)
+        z_match = torch.abs(pre_ndc_depth[wb_idx] - shared_depth[y_coords[wb_idx], x_coords[wb_idx]]) < 0.01
+        vis_idx = wb_idx[z_match]
+        if vis_idx.numel() == 0:
+            return override_color
+
+        heatmap_vals = similarity[y_coords[vis_idx], x_coords[vis_idx]].clamp(0.0, 1.0)
+        override_color[vis_idx] = heatmap_vals.unsqueeze(-1).expand(-1, 3)
+        return override_color
+
+    @torch.no_grad()
     def drive_run_loop(self):
         if self.embedding_encoder_job is None:
             _cp = ps.get_view_camera_parameters()
@@ -1228,6 +1323,63 @@ class PSGUI:
 
         self._seg_bbox_idx = bbox_idx
 
+        self.update_bbox_from_selection()
+
+    @torch.no_grad()
+    def segment_from_selection(self):
+        mask = self.current_selection.mask
+        if mask is None or not torch.any(mask):
+            return
+        if self.context_selection_mask is not None:
+            mask = mask | self.context_selection_mask
+            self.context_selection_mask = None
+
+        scene = self.render_kwargs["pc"]
+        has_embedding = scene._has_embedding.data.bool()
+        sel = mask & has_embedding
+        bbox_idx = torch.nonzero(sel, as_tuple=False).squeeze(1)
+        if bbox_idx.numel() < 2:
+            return
+
+        bbox_emb = torch.nn.functional.normalize(scene._embedding.data[bbox_idx], dim=1)
+        ndc = project_gaussian_means_to_2d_pos(scene._xyz.detach(), None)
+        bbox_ndc_pos = ndc[bbox_idx, :2]
+        bbox_center = bbox_ndc_pos.mean(dim=0)
+        ca = (bbox_ndc_pos - bbox_center).norm(dim=1).argmin().item()
+        cb = (bbox_emb @ bbox_emb[ca]).argmin().item()
+        centroids = torch.stack([bbox_emb[ca], bbox_emb[cb]])
+
+        labels = torch.zeros(bbox_idx.numel(), dtype=torch.long, device=DEFAULT_DEVICE)
+        for _ in range(10):
+            labels = (bbox_emb @ centroids.T).argmax(dim=1)
+            new_centroids = torch.stack([
+                torch.nn.functional.normalize(
+                    bbox_emb[labels == k].mean(dim=0, keepdim=True) if (labels == k).any() else centroids[k:k+1],
+                    dim=1,
+                ).squeeze(0)
+                for k in range(2)
+            ])
+            if torch.allclose(centroids, new_centroids, atol=1e-5):
+                break
+            centroids = new_centroids
+
+        cluster_centers = torch.stack([
+            bbox_ndc_pos[labels == k].mean(dim=0) if (labels == k).any() else bbox_center
+            for k in range(2)
+        ])
+        fg = (cluster_centers - bbox_center).norm(dim=1).argmin().item()
+        bg = 1 - fg
+
+        N = scene._xyz.shape[0]
+        selection = torch.zeros(N, dtype=torch.bool, device=DEFAULT_DEVICE)
+        selection[bbox_idx[labels == fg]] = True
+        self.current_selection.set_mask(selection)
+        self.selection_identifier = self.current_selection.identifier.detach().cpu().numpy()
+
+        context_mask = torch.zeros(N, dtype=torch.bool, device=DEFAULT_DEVICE)
+        context_mask[bbox_idx[labels == bg]] = True
+        self.context_selection_mask = context_mask
+        self._seg_bbox_idx = bbox_idx
         self.update_bbox_from_selection()
 
     @torch.no_grad()
@@ -1466,6 +1618,8 @@ class PSGUI:
                 _, self.heatmap_gamma = psim.SliderFloat(
                     "Heatmap gamma", self.heatmap_gamma, v_min=1.0, v_max=10.0
                 )
+                if psim.Button("Snapshot"):
+                    self.save_heatmap_snapshot()
 
             if psim.Button("Undo"):
                 if self.prev_scene is not None:
@@ -1476,9 +1630,8 @@ class PSGUI:
                 "Embedding Loop", self.embedding_loop_enabled
             )
 
-            _, self.segmentation_mode_enabled = psim.Checkbox(
-                "Segmentation Mode", self.segmentation_mode_enabled
-            )
+            if psim.Button("Segment"):
+                self.segment_from_selection()
 
             overlays_changed, self.ui_state.show_selection_overlays = psim.Checkbox(
                 "Show Selection Overlays", self.ui_state.show_selection_overlays
@@ -1684,9 +1837,7 @@ class PSGUI:
 
         with torch.no_grad():
             self.drag_handler.handle_callback(payload)
-            if self.segmentation_mode_enabled and self.drag_handler.drag_just_finalized:
-                self.handle_segmentation_bbox(payload.drag_bounds)
-            elif (
+            if (
                 payload.last_selection.identifier.detach().cpu().numpy()
                 != self.selection_identifier
                 and not self.drag_handler.is_drag_in_progress()
