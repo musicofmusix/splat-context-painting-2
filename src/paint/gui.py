@@ -39,10 +39,6 @@ class UIState:
     display_mode_idx: int = 0
     render_mode_idx: int = 0
     prev_render_mode_idx: int = None
-    selected_brush: int = 0
-    supported_brushes: list = None
-    supported_brush_paths: list = None
-    brush_path: str = None
     scene_path: str = None
     save_path: str = ""
     load_path: str = ""
@@ -89,16 +85,6 @@ def _mat3_to_quat(mat, ref_tensor: torch.Tensor) -> torch.Tensor:
     if isinstance(mat, torch.Tensor):
         mat = mat.detach().cpu().numpy()
     return ref_tensor.new_tensor(glm.quat_cast(glm.mat3(mat.astype(np.float32))))[None]
-
-def find_ply_files_in_dir_relative(directory):
-    cwd = os.getcwd()
-    ply_paths = []
-    for filename in os.listdir(directory):
-        if filename.lower().endswith(".ply"):
-            full_path = os.path.join(directory, filename)
-            relative_path = os.path.relpath(full_path, start=cwd)
-            ply_paths.append(relative_path)
-    return ply_paths
 
 class BrushManager:
     def __init__(self, device):
@@ -175,7 +161,6 @@ class PSGUI:
         render_fn,
         render_kwargs,
         scene_path=None,
-        brush_path=None
     ):
         self.ui_constants = UIConstants()
         self.ui_state = UIState()
@@ -185,16 +170,10 @@ class PSGUI:
         self.object_name = "gsplat object"
         self.prev_scene = None
 
-        self.ui_state.brush_path = brush_path
         self.sphere_center = torch.tensor(
             [0.0, 0.0, 0.0], device=DEFAULT_DEVICE, dtype=torch.float32
         )
         self.sphere_radius = 1
-        if brush_path is not None and not brush_path.endswith(".ply"):
-            self.ui_state.supported_brush_paths = find_ply_files_in_dir_relative(brush_path)
-            self.ui_state.supported_brushes = [
-                os.path.basename(brush) for brush in self.ui_state.supported_brush_paths
-            ]
         self.ui_state.scene_path = scene_path
         self.render_state.background = torch.tensor(
             conf.background_color, dtype=torch.float32, device=DEFAULT_DEVICE
@@ -252,9 +231,9 @@ class PSGUI:
 
         # embedding update exponential moving average param
         # higher = trust the past, lower = trust the present
-        self.ema_alpha = 0.75
+        self.ema_alpha = 0.33
         self.morph_radius = 0.05
-        self.heatmap_downsample = 2     # spatial downsample factor before FFT (1=off, 2=4× speedup, 4=16× speedup)
+        self.heatmap_downsample = 1     # spatial downsample factor before FFT (1=off, 2=4× speedup, 4=16× speedup)
         self.heatmap_gamma: float = 5.0  # power applied to per-pixel percentile rank (1=linear, >1=exaggerate top)
         self._seg_bbox_idx = None
 
@@ -270,6 +249,7 @@ class PSGUI:
         self._cached_heatmap_per_gaussian = None
         self._dino_pca_mean: torch.Tensor = None   # (DINO_DIM,)  fit on first DINO call
         self._dino_pca_basis: torch.Tensor = None  # (DINO_DIM, EMBEDDING_DIM)
+        self._embedding_best_coverage: torch.Tensor = None  # (N,) best 1/patch_density seen per gaussian
         ps.set_bounding_box(bbox_min - radius, bbox_max + radius)
         ps.init()
         
@@ -340,8 +320,6 @@ class PSGUI:
             )
             ps.register_curve_network("bbox", nodes, edges)
         ps.set_user_callback(self.ui_callback)
-        if brush_path is not None and brush_path.endswith(".ply"):
-            self.load_brush(brush_path)
         self.frame_scene()
         self.refresh_canvas(force=True) 
 
@@ -835,7 +813,7 @@ class PSGUI:
             data["context_indices"] = np.array([], dtype=np.int64)
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = f"heatmap_snapshot_{ts}.npz"
+        path = os.path.join("snapshots", f"heatmap_snapshot_{ts}.npz")
         np.savez_compressed(path, **data)
         print(f"Snapshot saved at {path}")
 
@@ -1149,24 +1127,40 @@ class PSGUI:
             print(f"[dino pca] fitted {target_dim}-dim basis from {sampled_embeddings.shape[0]} embeddings")
         sampled_embeddings = (sampled_embeddings - self._dino_pca_mean) @ self._dino_pca_basis  # (M, EMBEDDING_DIM)
 
+        # --- coverage weight: 1 / (number of visible gaussians sharing the same DINO patch cell) ---
+        patch_xi = (xs.float() * patch_w / w).long().clamp(0, patch_w - 1)
+        patch_yi = (ys.float() * patch_h / h).long().clamp(0, patch_h - 1)
+        patch_flat = patch_yi * patch_w + patch_xi  # (M,)
+        patch_counts = torch.bincount(patch_flat, minlength=patch_h * patch_w)  # (patch_h*patch_w,)
+        new_coverage = 1.0 / patch_counts[patch_flat].float()  # (M,) — higher when fewer gaussians share a patch
+
+        N_total = scene._xyz.shape[0]
+        if self._embedding_best_coverage is None or self._embedding_best_coverage.shape[0] != N_total:
+            self._embedding_best_coverage = torch.zeros(N_total, device=DEFAULT_DEVICE, dtype=torch.float32)
+
+        # indices into the full gaussian array for the M visible gaussians
+        visible_global_idx = torch.nonzero(visible, as_tuple=False).squeeze(1)  # (M,)
+
         with torch.no_grad():
-            # for entries that are both visible AND already has embeddings, use EMA to update
-            # size K list of gaussian indices that are visible and has/no embeddings
-            has_embedding_visible_idx = torch.nonzero(scene._has_embedding.data[visible], as_tuple=False).squeeze(1)
-            no_embedding_visible_idx = torch.nonzero(~scene._has_embedding.data[visible], as_tuple=False).squeeze(1)
-            # size N list of gaussian indices that are visible and has/no embeddings
-            has_embedding_visible = visible & scene._has_embedding.data
-            no_embedding_visible = visible & ~scene._has_embedding.data
+            best_so_far = self._embedding_best_coverage[visible_global_idx]  # (M,)
+            improves = new_coverage >= best_so_far  # (M,) bool — this view is at least as good as the best
 
-            # remember, sampled_embeddings is size MxD (visible gaussians only), while _embedding is size N (all gaussians)
-            scene._embedding.data[has_embedding_visible] = (
-                        self.ema_alpha * scene._embedding.data[has_embedding_visible]
-                        + (1.0 - self.ema_alpha) * sampled_embeddings[has_embedding_visible_idx]
-                )
+            improve_local = improves & scene._has_embedding.data[visible_global_idx]   # already has emb, and improves
+            new_local = improves & ~scene._has_embedding.data[visible_global_idx]      # no emb yet, and improves
 
-            # direct assignment for gaussians that do not yet have embeddings yet
-            scene._embedding.data[no_embedding_visible] = sampled_embeddings[no_embedding_visible_idx]
-            scene._has_embedding.data[no_embedding_visible] = True
+            improve_global = visible_global_idx[improve_local]
+            new_global = visible_global_idx[new_local]
+
+            # EMA blend only when the new view beats or matches the stored best; favour the new (closer) view
+            scene._embedding.data[improve_global] = (
+                self.ema_alpha * scene._embedding.data[improve_global]
+                + (1.0 - self.ema_alpha) * sampled_embeddings[improve_local]
+            )
+            scene._embedding.data[new_global] = sampled_embeddings[new_local]
+            scene._has_embedding.data[new_global] = True
+
+            # update best coverage for all gaussians that improved
+            self._embedding_best_coverage[visible_global_idx[improves]] = new_coverage[improves]
 
         return int(visible.sum().item())
 
@@ -1607,13 +1601,6 @@ class PSGUI:
             _, self.ui_state.render_mode_idx = psim.Combo(
                 "Channel", self.ui_state.render_mode_idx, self.ui_constants.SUPPORTED_RENDER_MODES
             )
-            if self.ui_state.supported_brushes is not None:
-                brush_change, self.ui_state.selected_brush = psim.Combo(
-                    "Brush", self.ui_state.selected_brush, self.ui_state.supported_brushes
-                )
-                if brush_change:
-                    self.load_brush(self.ui_state.supported_brush_paths[self.ui_state.selected_brush])
-
             if self.ui_constants.SUPPORTED_RENDER_MODES[self.ui_state.render_mode_idx] == "heatmap":
                 _, self.heatmap_gamma = psim.SliderFloat(
                     "Heatmap gamma", self.heatmap_gamma, v_min=1.0, v_max=10.0
