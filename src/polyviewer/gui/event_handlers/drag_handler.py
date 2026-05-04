@@ -1,32 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
-import numpy as np
 import polyscope as ps
 import polyscope.imgui as psim
 from typing import Tuple
 from src.polyviewer.entities.payload import CallbackPayload
 from src.polyviewer.entities.selection import GSplatSelection
 
+_RECT_COLOR = (255 << 24) | (0 << 16) | (255 << 8) | 255  # ImU32 yellow, full alpha
+
 
 class DragHandler:
-    GIZMOS_GROUP = "GIZMO_ELEMENTS"
-
     def __init__(self, continuous_selection=False):
-        selection_rect = ps.register_curve_network(
-            "selection_rect",
-            nodes=np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0]]),
-            edges="loop",
-            color=(1.0, 1.0, 1.0),
-            enabled=False,
-        )
-        selection_rect.set_radius(0.005, relative=False)
-        # selection_rect.set_is_using_screen_coords(True)
-        gizmos_group = ps.create_group(DragHandler.GIZMOS_GROUP)
-        # gizmos_group.set_is_hide_from_ui(True)
-        gizmos_group.set_hide_descendants_from_structure_lists(True)
-        gizmos_group.set_show_child_details(False)
-        selection_rect.add_to_group(gizmos_group)
         self.is_dragging: bool = False
         self.drag_just_finalized: bool = False
         self.lastMouseClick: Tuple[float, float] = None
@@ -34,10 +19,7 @@ class DragHandler:
         self.navigation_style: Tuple[float, float] = None
         self.continuous_selection: bool = continuous_selection
         self.assigned_mouse_button = psim.ImGuiMouseButton_Middle
-
-    @property
-    def selection_rect(self):
-        return ps.get_curve_network("selection_rect")
+        self.m_left_drag: bool = False
 
     def _drag_start(self):
         self.lastMouseClick = psim.GetMousePos()
@@ -47,7 +29,6 @@ class DragHandler:
 
     def _drag_move(self):
         window_w, window_h = ps.get_window_size()
-        self.selection_rect.set_enabled(True)
         currMousePos = psim.GetMousePos()
         self.lastDragDelta = (
             currMousePos[0] - self.lastMouseClick[0],
@@ -61,20 +42,9 @@ class DragHandler:
         x1 = 2.0 * x1 - 1.0
         y0 = 1.0 - 2.0 * y0
         y1 = 1.0 - 2.0 * y1
-
-        p0 = ps.screen_coords_to_world_position([self.lastMouseClick[0], self.lastMouseClick[1]])
-        p1 = ps.screen_coords_to_world_position([currMousePos[0], self.lastMouseClick[1]])
-        p2 = ps.screen_coords_to_world_position([currMousePos[0], currMousePos[1]])
-        p3 = ps.screen_coords_to_world_position([self.lastMouseClick[0], currMousePos[1]])
-
-        self.selection_rect.update_node_positions(
-            np.array([p0, p1, p2, p3])
-        )
-        
         if self.continuous_selection:
             return x0, y0, x1, y1
-        else:
-            return None
+        return None
 
     def _drag_end(self):
         window_w, window_h = ps.get_window_size()
@@ -101,17 +71,29 @@ class DragHandler:
         if psim.IsAnyMouseDown():
             if psim.IsMouseDown(self.assigned_mouse_button) and not self.is_dragging:
                 self._drag_start()
+                self.m_left_drag = False
+            elif psim.IsKeyDown(psim.ImGuiKey_M) and psim.IsMouseDown(psim.ImGuiMouseButton_Left) and not self.is_dragging:
+                self._drag_start()
+                self.m_left_drag = True
             if self.is_dragging and self.lastMouseClick is not None:
                 drag_bounds = self._drag_move()
-        if psim.IsMouseReleased(self.assigned_mouse_button):
+        release_button = psim.ImGuiMouseButton_Left if self.m_left_drag else self.assigned_mouse_button
+        if psim.IsMouseReleased(release_button):
             if self.is_dragging:
                 drag_bounds = self._drag_end()
                 finalize_selection = True
                 ps.set_navigation_style(self.navigation_style)
-                self.selection_rect.set_enabled(False)
                 self.is_dragging = False
+                self.m_left_drag = False
             else:
                 payload.last_selection.reset()
+
+        if self.is_dragging and self.lastMouseClick is not None:
+            curr = psim.GetMousePos()
+            p_min = (min(self.lastMouseClick[0], curr[0]), min(self.lastMouseClick[1], curr[1]))
+            p_max = (max(self.lastMouseClick[0], curr[0]), max(self.lastMouseClick[1], curr[1]))
+            psim.GetBackgroundDrawList().AddRect(p_min, p_max, _RECT_COLOR, 6.0, 0, 2.0)
+
         if drag_bounds is not None:
             x0, y0, x1, y1 = drag_bounds
             x0, x1 = (x1, x0) if x0 > x1 else (x0, x1)

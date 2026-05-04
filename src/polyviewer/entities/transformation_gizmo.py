@@ -10,7 +10,7 @@ import copy
 class TransformationGizmo:
     def __init__(self):
         self.point_cloud = ps.register_point_cloud(
-            "transformation_gizmo", np.zeros([1, 3]), transparency=0.0, enabled=True
+            "transformation_gizmo", np.zeros([1, 3]), transparency=0.0, enabled=False
         )
         self.canonical_pos = None
         self.canonical_rotation = None
