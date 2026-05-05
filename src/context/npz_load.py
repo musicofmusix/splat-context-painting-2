@@ -36,3 +36,16 @@ context_mask[context_idx] = True
 print(f"N={N}  embedded={has_embedding.sum()}  "
       f"heatmap={has_heatmap.sum()}  "
       f"subject={subject_mask.sum()}  context={context_mask.sum()}")
+
+# Returns (subject_centroid - context_centroid) as a (3,) vector.
+def compute_subject_context_offset(data):
+    xyz = data["xyz"]
+    subject_idx = data["subject_indices"]
+    context_idx = data["context_indices"]
+    offset = xyz[subject_idx].mean(axis=0) - xyz[context_idx].mean(axis=0)
+    print(f"subject centroid : {xyz[subject_idx].mean(axis=0)}")
+    print(f"context centroid : {xyz[context_idx].mean(axis=0)}")
+    print(f"offset (sub-ctx) : {offset}")
+    return offset
+
+compute_subject_context_offset(d)
