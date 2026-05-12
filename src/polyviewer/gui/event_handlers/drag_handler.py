@@ -7,13 +7,16 @@ from typing import Tuple
 from src.polyviewer.entities.payload import CallbackPayload
 from src.polyviewer.entities.selection import GSplatSelection
 
-_RECT_COLOR = (255 << 24) | (0 << 16) | (255 << 8) | 255  # ImU32 yellow, full alpha
+_RECT_COLOR = (255 << 24) | (39 << 16) | (39 << 8) | 242    # #F22727 red, full alpha
+_CONTEXT_RECT_COLOR = (255 << 24) | (140 << 16) | (59 << 8) | 32  # #203B8C blue, full alpha
 
 
 class DragHandler:
     def __init__(self, continuous_selection=False):
         self.is_dragging: bool = False
         self.drag_just_finalized: bool = False
+        self.context_drag_just_finalized: bool = False
+        self.is_context_drag: bool = False
         self.lastMouseClick: Tuple[float, float] = None
         self.lastDragDelta = None
         self.navigation_style: Tuple[float, float] = None
@@ -65,14 +68,17 @@ class DragHandler:
 
     def handle_callback(self, payload: CallbackPayload):
         self.drag_just_finalized = False
+        self.context_drag_just_finalized = False
         io = psim.GetIO()
         drag_bounds = None
         finalize_selection = False
         if psim.IsAnyMouseDown():
             if psim.IsMouseDown(self.assigned_mouse_button) and not self.is_dragging:
+                self.is_context_drag = psim.IsKeyDown(psim.ImGuiKey_C)
                 self._drag_start()
                 self.m_left_drag = False
             elif psim.IsKeyDown(psim.ImGuiKey_M) and psim.IsMouseDown(psim.ImGuiMouseButton_Left) and not self.is_dragging:
+                self.is_context_drag = False
                 self._drag_start()
                 self.m_left_drag = True
             if self.is_dragging and self.lastMouseClick is not None:
@@ -85,31 +91,45 @@ class DragHandler:
                 ps.set_navigation_style(self.navigation_style)
                 self.is_dragging = False
                 self.m_left_drag = False
-            else:
+            elif not self.is_context_drag:
                 payload.last_selection.reset()
 
         if self.is_dragging and self.lastMouseClick is not None:
             curr = psim.GetMousePos()
             p_min = (min(self.lastMouseClick[0], curr[0]), min(self.lastMouseClick[1], curr[1]))
             p_max = (max(self.lastMouseClick[0], curr[0]), max(self.lastMouseClick[1], curr[1]))
-            psim.GetBackgroundDrawList().AddRect(p_min, p_max, _RECT_COLOR, 6.0, 0, 2.0)
+            rect_color = _CONTEXT_RECT_COLOR if self.is_context_drag else _RECT_COLOR
+            psim.GetBackgroundDrawList().AddRect(p_min, p_max, rect_color, 6.0, 0, 2.0)
 
         if drag_bounds is not None:
             x0, y0, x1, y1 = drag_bounds
             x0, x1 = (x1, x0) if x0 > x1 else (x0, x1)
             y0, y1 = (y1, y0) if y0 > y1 else (y0, y1)
             payload.drag_bounds = x0, y0, x1, y1
-            if io.KeyShift:
-                payload.selection_preview = payload.last_selection.add(payload)
-            elif io.KeyAlt:
-                payload.selection_preview = payload.last_selection.remove(payload)
-            elif io.KeyCtrl:
-                payload.selection_preview = payload.last_selection.intersect(payload)
+            if self.is_context_drag:
+                ctx = payload.last_context_selection
+                if io.KeyShift:
+                    ctx.add(payload)
+                elif io.KeyAlt:
+                    ctx.remove(payload)
+                else:
+                    ctx = GSplatSelection().select(payload)
+                    payload.last_context_selection = ctx
+                if finalize_selection:
+                    self.context_drag_just_finalized = True
+                    self.is_context_drag = False
             else:
-                payload.selection_preview = GSplatSelection().select(payload)
-            if finalize_selection:
-                self.drag_just_finalized = True
-                payload.last_selection = payload.selection_preview
+                if io.KeyShift:
+                    payload.selection_preview = payload.last_selection.add(payload)
+                elif io.KeyAlt:
+                    payload.selection_preview = payload.last_selection.remove(payload)
+                elif io.KeyCtrl:
+                    payload.selection_preview = payload.last_selection.intersect(payload)
+                else:
+                    payload.selection_preview = GSplatSelection().select(payload)
+                if finalize_selection:
+                    self.drag_just_finalized = True
+                    payload.last_selection = payload.selection_preview
 
     def is_drag_in_progress(self):
         return self.is_dragging

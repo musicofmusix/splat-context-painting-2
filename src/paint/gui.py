@@ -3,7 +3,6 @@
 import copy
 import math
 from concurrent.futures import ThreadPoolExecutor
-import glm
 import os
 import time
 from src.paint.render import *
@@ -50,8 +49,14 @@ UP_AXIS_VECS = {
     "z_up": np.array([0., 0., 1.]), "neg_z_up": np.array([0., 0., -1.]),
 }
 
-# fit oriented bbox
+
 def fit_obb(pts, up):
+    """Return (nodes (8,3), face_normals (6,3)) for an OBB.
+
+    The up axis is fixed to `up`; PCA is performed only in the perpendicular
+    plane, giving a tight horizontal fit while keeping the box axis-aligned
+    to the world up direction.
+    """
     center = pts.mean(axis=0)
     # Project out the up component → 2D horizontal coords for PCA
     horiz = pts - np.outer(pts @ up, up)
@@ -107,7 +112,7 @@ class UIState:
     save_path: str = ""
     load_path: str = ""
     enable_key_bindings: bool = False
-    show_selection_overlays: bool = True
+    show_bbox_wireframe: bool = True
 
 @dataclass
 class RenderState:
@@ -225,6 +230,7 @@ class PSGUI:
         render_fn,
         render_kwargs,
         scene_path=None,
+        snapshot=None,
     ):
         self.ui_constants = UIConstants()
         self.ui_state = UIState()
@@ -301,7 +307,7 @@ class PSGUI:
         self.ema_alpha = 0.33
         self.morph_radius = 0.05
         self.heatmap_gamma: float = 5.0  # power applied to per-pixel percentile rank (1=linear, >1=exaggerate top)
-        self.voxel_resolution: int = 64  # cells along the longest scene axis for 3D heatmap
+        self.voxel_resolution: int = 128  # cells along the longest scene axis for 3D heatmap
         self._use_3d_heatmap: bool = False  # when True, render uses _cached_heatmap_per_gaussian from 3D NCC
         self._seg_bbox_idx = None
 
@@ -387,7 +393,38 @@ class PSGUI:
             ps.register_curve_network("bbox", nodes, edges)
         ps.set_user_callback(self.ui_callback)
         self.frame_scene()
+        if snapshot is not None:
+            self.restore_from_snapshot(snapshot)
         self.refresh_canvas(force=True)
+
+    def restore_from_snapshot(self, snapshot):
+        N = self.model._xyz.shape[0]
+
+        heatmap_vals = snapshot["heatmap_values"]
+        valid = ~np.isnan(heatmap_vals)
+        if valid.any():
+            vals = heatmap_vals.copy()
+            vals[~valid] = 0.0
+            self._cached_heatmap_per_gaussian = torch.tensor(
+                vals, dtype=torch.float32, device=DEFAULT_DEVICE
+            )
+            self._use_3d_heatmap = True
+
+        subj_idx = snapshot["subject_indices"].astype(np.int64)
+        if len(subj_idx) > 0:
+            mask = torch.zeros(N, dtype=torch.bool, device=DEFAULT_DEVICE)
+            mask[torch.tensor(subj_idx, device=DEFAULT_DEVICE)] = True
+            self.current_selection.set_mask(mask)
+            self.selection_identifier = self.current_selection.identifier.detach().cpu().numpy()
+
+        ctx_idx = snapshot["context_indices"].astype(np.int64)
+        if len(ctx_idx) > 0:
+            mask = torch.zeros(N, dtype=torch.bool, device=DEFAULT_DEVICE)
+            mask[torch.tensor(ctx_idx, device=DEFAULT_DEVICE)] = True
+            self.context_selection_mask = mask
+
+        self.ui_state.render_mode_idx = self.ui_constants.SUPPORTED_RENDER_MODES.index("heatmap")
+        self.update_bbox_from_selection()
 
     # Setup / scene state
     def init_segments(self):
@@ -628,12 +665,12 @@ class PSGUI:
         if has_subject:
             override_color[:N][subject_mask] = (
                 override_color[:N][subject_mask] * 0.3
-                + torch.tensor([1.0, 0.15, 0.15], device=DEFAULT_DEVICE) * 0.7
+                + torch.tensor([242/255, 39/255, 39/255], device=DEFAULT_DEVICE) * 0.7
             )
         if has_context:
             override_color[:N][context_mask] = (
                 override_color[:N][context_mask] * 0.3
-                + torch.tensor([0.15, 0.15, 1.0], device=DEFAULT_DEVICE) * 0.7
+                + torch.tensor([32/255, 59/255, 140/255], device=DEFAULT_DEVICE) * 0.7
             )
         return override_color
 
@@ -758,7 +795,7 @@ class PSGUI:
         self.context_selection_mask = None
         ps.register_point_cloud("context_xyz", np.zeros((0, 3)))
         context_pc = ps.get_point_cloud("context_xyz")
-        context_pc.set_color((1.0, 1.0, 0.0))
+        context_pc.set_color((32/255, 59/255, 140/255))
 
     def recompute_context_selection(self):
         if self.current_selection.mask is None or not torch.any(self.current_selection.mask):
@@ -1386,15 +1423,24 @@ class PSGUI:
             return self._cached_scene_pc
         return None
 
+    # -------------------------------------------------------------------------
     # 3D template-matching heatmap
+    # -------------------------------------------------------------------------
+
     @torch.no_grad()
     def voxelize_gaussians(self, pc, xyz_min, cell_size, grid_dims):
         """Sparse voxelization of a GaussianModel into a regular grid.
+
+        Only gaussians with valid embeddings contribute to cell embeddings.
+        Each embedding is L2-normalised before averaging so the cell vector
+        preserves directional meaning.
+
         Returns:
             cell_coords:      (C, 3) int64  — occupied cell coordinates
             cell_embeddings:  (C, D) float  — L2-normalised avg embedding per cell
             gauss_vox_coords: (N, 3) int64  — voxel coordinate of every gaussian
             occupancy:        (X, Y, Z) bool — dense occupancy mask
+
         Returns (None, None, None, None) if no gaussian has a valid embedding.
         """
         xyz = pc._xyz.detach()                       # (N, 3)
@@ -1450,12 +1496,14 @@ class PSGUI:
         ctx_cell_coords, ctx_cell_embs, ctx_box_dims,
     ):
         """FFT-based 3D normalised cross-correlation, one embedding dimension at a time.
+
         scene_cell_coords: (C_s, 3) int64
         scene_cell_embs:   (C_s, D) float  — L2-normalised
         scene_grid_dims:   (X, Y, Z) tuple
         ctx_cell_coords:   (C_c, 3) int64  — relative to ctx bounding-box corner
         ctx_cell_embs:     (C_c, D) float  — L2-normalised
         ctx_box_dims:      (kX, kY, kZ) tuple
+
         Returns (X, Y, Z) float similarity tensor.
         """
         X, Y, Z = scene_grid_dims
@@ -1599,6 +1647,7 @@ class PSGUI:
     def draw_render_panel(self):
         if psim.TreeNode("Render"):
             psim.PushItemWidth(100)
+
             _, self.ui_state.render_mode_idx = psim.Combo(
                 "Channel", self.ui_state.render_mode_idx, self.ui_constants.SUPPORTED_RENDER_MODES
             )
@@ -1627,39 +1676,34 @@ class PSGUI:
             if psim.Button("Segment"):
                 self.segment_from_selection()
 
-            overlays_changed, self.ui_state.show_selection_overlays = psim.Checkbox(
-                "Show Selection Overlays", self.ui_state.show_selection_overlays
+            _, self.ui_state.show_bbox_wireframe = psim.Checkbox(
+                "Show Bbox Wireframe", self.ui_state.show_bbox_wireframe
             )
 
             _, self.morph_radius = psim.SliderFloat(
-                "Morph Radius", self.morph_radius, v_min=0.001, v_max=0.25
+                "Erode Radius", self.morph_radius, v_min=0.001, v_max=0.25
             )
+            psim.PushStyleColor(psim.ImGuiCol_Button,        (242/255, 39/255, 39/255, 1.0))
+            psim.PushStyleColor(psim.ImGuiCol_ButtonHovered, (1.0,    0.25,  0.25,   1.0))
+            psim.PushStyleColor(psim.ImGuiCol_ButtonActive,  (0.70,   0.10,  0.10,   1.0))
             if psim.Button("Erode Subject"):
                 self.morph_mask()
+            psim.PopStyleColor(3)
             psim.SameLine()
+            psim.PushStyleColor(psim.ImGuiCol_Button,        (32/255, 59/255, 140/255, 1.0))
+            psim.PushStyleColor(psim.ImGuiCol_ButtonHovered, (0.18,  0.30,   0.65,    1.0))
+            psim.PushStyleColor(psim.ImGuiCol_ButtonActive,  (0.09,  0.17,   0.40,    1.0))
             if psim.Button("Erode Context"):
                 self.morph_mask(context=True)
+            psim.PopStyleColor(3)
             psim.SameLine()
             if psim.Button("Swap FG/BG"):
                 self.swap_selection_context()
-
+            psim.SameLine()
             if psim.Button("Clear Selection"):
                 self.clear_selection()
 
             psim.PopItemWidth()
-            psim.TreePop()
-
-    def draw_scene_settings_panel(self):
-        if psim.TreeNode("Scene Settings"):
-            if psim.Button("Reset Scene"):
-                gaussians = GaussianModel(3)
-                gaussians.load_ply(self.ui_state.scene_path)
-                self.render_kwargs["pc"] = gaussians
-                self._invalidate_filtered_pc_cache()
-            if psim.Button("Save Scene"):
-                self.render_kwargs["pc"].save_ply(
-                    os.path.join("asset_data/current_scene.ply")
-                )
             psim.TreePop()
 
     def draw_brush_setup_panel(self):
@@ -1708,12 +1752,6 @@ class PSGUI:
 
             psim.TreePop()
         return disp_change
-
-    def draw_brush_parameters_panel(self):
-        if psim.TreeNode("Brush Parameters"):
-            _, self.blend_percentage = psim.SliderFloat("Spacing", self.blend_percentage, v_min=-1.0, v_max=1.0)
-            _, self.z_offset = psim.SliderFloat("Z Offset", self.z_offset, v_min=-2.5, v_max=2.5)
-            psim.TreePop()
 
     def toggle_brush_edit_mode(self):
         self.brush_edit_mode = not self.brush_edit_mode
@@ -1776,12 +1814,19 @@ class PSGUI:
                 self.toggle_brush_edit_mode()
 
     def ui_callback(self):
+        psim.PushStyleColor(psim.ImGuiCol_Button,        (0.0, 0.0, 0.0, 1.0))
+        psim.PushStyleColor(psim.ImGuiCol_ButtonHovered, (0.2, 0.2, 0.2, 1.0))
+        psim.PushStyleColor(psim.ImGuiCol_ButtonActive,  (0.35, 0.35, 0.35, 1.0))
         self.model = self.render_kwargs["pc"]
+        _ctx_sel = GSplatSelection()
+        if self.context_selection_mask is not None:
+            _ctx_sel.mask = self.context_selection_mask.clone()
         payload = CallbackPayload(
             model=self.model,
             camera=ps.get_view_camera_parameters(),
             last_selection=self.current_selection,
             selection_preview=self.current_selection,
+            last_context_selection=_ctx_sel,
             segments=self.segments,
             gui_mode=self.ui_state.gui_mode,
             transformation_gizmo=self.gizmo,
@@ -1789,7 +1834,6 @@ class PSGUI:
         psim.SetNextItemOpen(True, psim.ImGuiCond_FirstUseEver)
 
         self.draw_render_panel()
-        self.draw_scene_settings_panel()
         disp_change = self.draw_brush_setup_panel()
 
         if disp_change and self.ui_state.display_mode_idx == 1:
@@ -1805,7 +1849,6 @@ class PSGUI:
         if disp_change and self.ui_state.display_mode_idx == 0:
             ps.set_ground_plane_mode("none")
 
-        self.draw_brush_parameters_panel()
         self.handle_key_bindings()
 
         if self.brush_edit_mode:
@@ -1824,7 +1867,9 @@ class PSGUI:
 
         with torch.no_grad():
             self.drag_handler.handle_callback(payload)
-            if (
+            if self.drag_handler.context_drag_just_finalized:
+                self.context_selection_mask = payload.last_context_selection.mask
+            elif (
                 payload.last_selection.identifier.detach().cpu().numpy()
                 != self.selection_identifier
                 and not self.drag_handler.is_drag_in_progress()
@@ -1836,7 +1881,10 @@ class PSGUI:
                 self.recompute_context_selection()
                 self.update_bbox_from_selection()
 
-        self.draw_clip_box_overlay()
+        if self.ui_state.show_bbox_wireframe:
+            self.draw_clip_box_overlay()
+
+        psim.PopStyleColor(3)
 
         if self.embedding_loop_enabled:
             self.drive_run_loop()

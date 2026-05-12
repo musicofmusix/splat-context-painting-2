@@ -28,6 +28,7 @@ class CallbackPayload:
     camera: ps.CameraParameters = None
     last_selection: SplatPointSelection = None
     selection_preview: SplatPointSelection = None
+    last_context_selection: object = None
     drag_bounds: Tuple[float, float, float, float] = None
     segments: Dict[str, Segment] = None
     gui_mode: GuiMode = None
